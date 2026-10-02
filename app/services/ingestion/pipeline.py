@@ -70,6 +70,20 @@ class IngestionService:
             )
             points.append(point)
 
+        # Step 3b: Tombstone/purge prior version chunks for this document in the tenant partition
+        try:
+            self.qdrant.delete(
+                collection_name=settings.QDRANT_COLLECTION_NAME,
+                points_selector=models.Filter(
+                    must=[
+                        models.FieldCondition(key="tenant_id", match=models.MatchValue(value=security_context.tenant_id)),
+                        models.FieldCondition(key="document_id", match=models.MatchValue(value=request.document_id)),
+                    ]
+                )
+            )
+        except Exception:
+            pass
+
         # Step 4: Upsert points into Qdrant collection
         self.qdrant.upsert(
             collection_name=settings.QDRANT_COLLECTION_NAME,
