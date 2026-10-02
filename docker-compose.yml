@@ -1,23 +1,27 @@
-version: '3.8'
-
 services:
-  rag-microservice:
+  enterprise-rag-service:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: enterprise-rag-service
     ports:
       - "8000:8000"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       - ENVIRONMENT=production
-      - QDRANT_USE_IN_MEMORY=True
+      - LOG_LEVEL=INFO
+      - EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
       - QDRANT_COLLECTION_NAME=enterprise_knowledge_base
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - GROQ_MODEL=openai/gpt-oss-20b
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7}
-    restart: unless-stopped
+      - QDRANT_STORAGE_PATH=/data/qdrant_storage
+    volumes:
+      - ./data/qdrant_storage:/data/qdrant_storage
+      - /home/vscode/.cache:/home/appuser/.cache
+    restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
+      start_period: 40s

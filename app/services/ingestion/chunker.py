@@ -128,9 +128,9 @@ def chunk_document(
             content_hash=content_hash,
             token_count=token_count,
             tenant_id=security_context.tenant_id,
-            allowed_roles=request.allowed_roles,
+            allowed_roles=request.allowed_roles or ["*", "admin", "user"],
             allowed_groups=request.allowed_groups,
-            classification=request.classification,
+            classification=request.classification or getattr(security_context, "clearance", "public") or "public",
             security_policy_version=security_context.policy_version,
         )
         result_chunks.append(payload)

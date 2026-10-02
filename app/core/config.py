@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     QDRANT_PORT: int = 6333
     QDRANT_API_KEY: str = ""
     QDRANT_COLLECTION_NAME: str = "enterprise_knowledge_base"
+    QDRANT_STORAGE_PATH: str = "/workspaces/Enterprise-Rag-Microservice/data/qdrant_storage"
     QDRANT_USE_IN_MEMORY: bool = True
 
     # Dense Embedding Engine (FastEmbed)

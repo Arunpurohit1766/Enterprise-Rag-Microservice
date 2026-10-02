@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
 from app.api.v1.endpoints.rag import router as rag_router
+from app.api.v1.endpoints.auth import router as auth_router
 from app.core.config import settings
 
 
@@ -45,6 +46,7 @@ async def root():
 
 
 # Mount API v1 Routes
+app.include_router(auth_router, prefix="/api/v1")
 app.include_router(rag_router, prefix=f"{settings.API_V1_STR}/rag", tags=["RAG"])
 
 

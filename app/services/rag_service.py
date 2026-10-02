@@ -147,7 +147,18 @@ class EnterpriseRAGService:
         verify_time_ms = (time.perf_counter() - verify_start) * 1000
         total_time_ms = (time.perf_counter() - start_time) * 1000
 
-        citations_list = [c.model_dump() if hasattr(c, "model_dump") else c for c in ranked_chunks]
+        citations_list = []
+        for idx, c in enumerate(ranked_chunks):
+            c_dict = c.model_dump() if hasattr(c, "model_dump") else (c if isinstance(c, dict) else {})
+            ch_id = c_dict.get("chunk_id", f"ch_{idx}")
+            doc_id = c_dict.get("document_id", "doc")
+            quote_text = c_dict.get("content", "")[:200]
+            citations_list.append(Citation(
+                citation_id=f"cit_{idx+1}",
+                chunk_id=ch_id,
+                document_id=doc_id,
+                quote=quote_text
+            ))
 
         engine_timings = getattr(self.retrieval_engine, "last_search_timings", {})
         timing_receipt = TimingReceipt(
