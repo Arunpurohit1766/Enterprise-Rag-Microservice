@@ -1,93 +1,106 @@
 """
-Pre-Generation Evidence & Answerability Gate.
-Evaluates whether retrieved evidence is sufficient to answer the user query
-before invoking the LLM.
-Features calibrated routing: hard identifiers (ports/error codes) vs soft identifiers (years).
+Enterprise RAG Microservice - Calibrated Evidence Gate Service
 """
-
 import re
-from typing import List, Set
+import logging
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel, Field
 from app.core.config import settings
-from app.schemas.rag import EvidenceGateDecision, QueryType, ScoredChunk
-from app.services.retrieval.normalizer import classify_query
 
+logger = logging.getLogger(__name__)
 
-# Hard technical identifiers that must strictly be present
-HARD_IDENTIFIER_PATTERNS = [
-    re.compile(r"\b\d{4,5}\b"),                         # Ports (e.g. 51820, 6443)
-    re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"), # IPv4 Addresses
-    re.compile(r"\b[A-Z0-9_\-]{4,}(?:_[A-Z0-9]+)+\b"),    # Error Codes (ERR_...)
-]
-
-# Soft identifiers (e.g. years) that can be overridden if semantic relevance is exceptionally high
-YEAR_PATTERN = re.compile(r"\b(19\d\d|20\d\d)\b")
-
+class GatingDecision(BaseModel):
+    is_answerable: bool
+    confidence_score: float
+    selected_chunks: List[Any] = Field(default_factory=list)
+    reason: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    telemetry: Dict[str, Any] = Field(default_factory=dict)
 
 class EvidenceGate:
-    """Evaluates answerability of candidate evidence."""
+    MIN_ABSOLUTE_CONFIDENCE: float = 0.40
+
+    def __init__(self, default_threshold: Optional[float] = None):
+        self.default_threshold = default_threshold or getattr(settings, "SIMILARITY_THRESHOLD", 0.5)
+
+    def _extract_chunk_text(self, c: Any) -> str:
+        if hasattr(c, "chunk") and hasattr(c.chunk, "content"):
+            return str(c.chunk.content)
+        if hasattr(c, "content"):
+            return str(c.content)
+        if isinstance(c, dict):
+            if "content" in c:
+                return str(c["content"])
+            if "chunk" in c and isinstance(c["chunk"], dict):
+                return str(c["chunk"].get("content", ""))
+        return ""
 
     def evaluate(
         self,
         query: str,
-        candidates: List[ScoredChunk]
-    ) -> EvidenceGateDecision:
-        """
-        Evaluates answerability:
-        1. Emptiness check (zero candidates -> abstain).
-        2. Relevance score cutoff.
-        3. Differentiated identifier coverage (hard vs soft).
-        """
-        if not candidates:
-            return EvidenceGateDecision(
+        retrieved_chunks: List[Any],
+        caller_threshold: Optional[float] = None
+    ) -> GatingDecision:
+        if not retrieved_chunks:
+            return GatingDecision(
                 is_answerable=False,
                 confidence_score=0.0,
-                reason="No authorized evidence chunks retrieved for query."
+                selected_chunks=[],
+                rejection_reason="NO_CHUNKS_RETRIEVED",
+                telemetry={"retrieved_count": 0}
             )
 
-        top_candidate = candidates[0]
-        top_score = top_candidate.dense_score if top_candidate.dense_score is not None else 0.0
+        threshold = max(self.default_threshold, self.MIN_ABSOLUTE_CONFIDENCE)
+        if caller_threshold is not None:
+            threshold = max(threshold, caller_threshold)
 
-        # Check 1: Minimum relevance cutoff
-        if top_score < settings.ANSWERABILITY_THRESHOLD:
-            return EvidenceGateDecision(
+        def _get_score(c: Any) -> float:
+            if hasattr(c, "rerank_score") and c.rerank_score is not None:
+                return float(c.rerank_score)
+            if hasattr(c, "dense_score") and c.dense_score is not None:
+                return float(c.dense_score)
+            if hasattr(c, "score") and c.score is not None:
+                return float(c.score)
+            if isinstance(c, dict):
+                return float(c.get("rerank_score") or c.get("dense_score") or c.get("score") or 0.0)
+            return 0.0
+
+        # Check for specific hard factual numbers/ports mentioned in query missing from retrieved evidence
+        query_numbers = set(re.findall(r"[0-9]+", query))
+        corpus_text = " ".join(self._extract_chunk_text(c) for c in retrieved_chunks)
+        corpus_numbers = set(re.findall(r"[0-9]+", corpus_text))
+        missing_numbers = query_numbers - corpus_numbers
+
+        scored_chunks = sorted(retrieved_chunks, key=_get_score, reverse=True)
+        top_score = _get_score(scored_chunks[0])
+        qualified_chunks = [c for c in scored_chunks if _get_score(c) >= threshold]
+
+        if missing_numbers:
+            logger.info("evidence_gate_abstained: query contains numbers missing from evidence: %s", missing_numbers)
+            return GatingDecision(
                 is_answerable=False,
-                confidence_score=round(top_score, 3),
-                reason=f"Top candidate relevance score ({top_score:.3f}) below answerability threshold ({settings.ANSWERABILITY_THRESHOLD})."
+                confidence_score=0.0,
+                selected_chunks=[],
+                reason=f"Missing factual keywords: {missing_numbers}",
+                rejection_reason=f"Missing factual keywords: {missing_numbers}",
+                telemetry={"missing_numbers": list(missing_numbers)}
             )
 
-        all_evidence_text = " ".join([c.chunk.content for c in candidates]).lower()
+        if top_score < threshold:
+            return GatingDecision(
+                is_answerable=False,
+                confidence_score=top_score,
+                selected_chunks=[],
+                rejection_reason=f"Top chunk score ({top_score:.3f}) below threshold ({threshold:.3f})",
+                telemetry={"top_score": top_score, "threshold": threshold}
+            )
 
-        # Check 2: Hard Technical Identifiers (Ports, IPs, Error codes)
-        for pattern in HARD_IDENTIFIER_PATTERNS:
-            # Exclude 4-digit years from being treated as strictly hard ports
-            matches = [m for m in pattern.findall(query) if not YEAR_PATTERN.match(m)]
-            for match in matches:
-                if match.lower() not in all_evidence_text:
-                    return EvidenceGateDecision(
-                        is_answerable=False,
-                        confidence_score=0.2,
-                        reason=f"Missing required technical identifier '{match}' in retrieved evidence."
-                    )
-
-        # Check 3: Soft Identifiers (Years)
-        years = YEAR_PATTERN.findall(query)
-        if years:
-            missing_years = [y for y in years if y not in all_evidence_text]
-            # If a year is missing, but semantic score is exceptionally high (>= 0.85), allow with warning
-            if missing_years and top_score < 0.85:
-                return EvidenceGateDecision(
-                    is_answerable=False,
-                    confidence_score=0.35,
-                    reason=f"Query specifies temporal constraint {missing_years} not found in evidence."
-                )
-
-        # Evidence is sufficient to answer
-        return EvidenceGateDecision(
+        return GatingDecision(
             is_answerable=True,
-            confidence_score=round(max(top_score, 0.75), 3),
-            reason="Retrieved evidence satisfies relevance and identifier criteria."
+            confidence_score=top_score,
+            selected_chunks=qualified_chunks,
+            rejection_reason=None,
+            telemetry={"top_score": top_score, "qualified_count": len(qualified_chunks)}
         )
 
-
-# Singleton evidence gate
 evidence_gate = EvidenceGate()

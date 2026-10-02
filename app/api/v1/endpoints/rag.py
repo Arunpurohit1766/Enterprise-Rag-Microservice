@@ -67,4 +67,4 @@ async def query_knowledge_base(
     5. Structured Groq Generation.
     6. Post-generation citation verification.
     """
-    return rag_service.execute_query(request, ctx)
+    return await rag_service.execute_query(request, ctx)
