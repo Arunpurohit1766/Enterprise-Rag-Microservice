@@ -1,0 +1,23 @@
+# Security: NEVER bake local secrets or environment files into images
+.env
+.env.local
+*.env
+
+# Version control
+.git
+.gitignore
+
+# Python Bytecode & Cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+
+# Local virtualenvs and IDEs
+venv
+.venv
+.vscode
+.idea
