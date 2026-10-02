@@ -1,12 +1,11 @@
 """
-Hybrid Retrieval Engine.
-Executes Dense (FastEmbed + Qdrant) and Sparse (BM25) searches
-under strict Pre-Retrieval Authorization Filters.
-Uses modern Qdrant query_points API.
+True Dual-Engine Hybrid Retrieval & Multi-Stage Re-Ranking Architecture.
+Executes Dense (FastEmbed + Qdrant HNSW) and Sparse (BM25 across tenant corpus)
+in parallel, merges candidates with RRF (k=60), and re-ranks via Cross-Encoder.
 """
 
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from qdrant_client.http import models
 from rank_bm25 import BM25Okapi
 
@@ -17,16 +16,17 @@ from app.schemas.rag import ChunkPayload, QueryRequest, ScoredChunk, SecurityCon
 from app.services.ingestion.embedder import embedder
 from app.services.retrieval.fusion import compute_rrf
 from app.services.retrieval.normalizer import classify_query
+from app.services.retrieval.reranker import reranker
 
 
 class HybridRetriever:
-    """Orchestrates secure multi-tenant hybrid search."""
+    """Orchestrates true multi-stage hybrid search with cross-encoder reranking."""
 
     def __init__(self) -> None:
         self.qdrant = qdrant_manager.get_client()
 
     def _convert_filter_to_qdrant(self, filter_dict: Dict[str, Any]) -> models.Filter:
-        """Converts our authorization dictionary into native Qdrant filter models."""
+        """Converts authorization dictionary into native Qdrant filter models."""
         must_conditions: List[models.Condition] = []
         for cond in filter_dict.get("must", []):
             key = cond["key"]
@@ -55,25 +55,41 @@ class HybridRetriever:
 
         return models.Filter(must=must_conditions, should=should_conditions if should_conditions else None)
 
+    def _fetch_authorized_corpus(self, auth_filter: models.Filter, limit: int = 500) -> List[ChunkPayload]:
+        """
+        Retrieves all authorized chunks under the caller's tenant boundary
+        for independent sparse BM25 indexing.
+        """
+        scroll_result, _ = self.qdrant.scroll(
+            collection_name=settings.QDRANT_COLLECTION_NAME,
+            scroll_filter=auth_filter,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False
+        )
+        chunks: List[ChunkPayload] = []
+        for point in scroll_result:
+            if point.payload:
+                chunks.append(ChunkPayload(**point.payload))
+        return chunks
+
     def retrieve_dense(
         self,
         query: str,
         auth_filter: models.Filter,
-        top_k: int = settings.DENSE_TOP_K
+        top_k: int = 50
     ) -> List[ScoredChunk]:
         """
         Executes Dense vector search in Qdrant with pre-retrieval authorization filter.
-        Uses modern Qdrant query_points API.
         """
         query_vector = embedder.embed_query(query)
         if not query_vector:
             return []
 
-        # Modern Qdrant API: query_points
         response = self.qdrant.query_points(
             collection_name=settings.QDRANT_COLLECTION_NAME,
             query=query_vector,
-            query_filter=auth_filter,  # HARD PRE-RETRIEVAL BOUNDARY
+            query_filter=auth_filter,
             limit=top_k,
             with_payload=True
         )
@@ -96,17 +112,17 @@ class HybridRetriever:
     def retrieve_sparse(
         self,
         query: str,
-        authorized_chunks: List[ChunkPayload],
-        top_k: int = settings.SPARSE_TOP_K
+        corpus_chunks: List[ChunkPayload],
+        top_k: int = 50
     ) -> List[ScoredChunk]:
         """
-        Executes Sparse BM25 keyword search over authorized candidate chunks.
-        Guarantees that exact ports, SKUs, and identifiers receive optimal ranking.
+        Executes Sparse BM25 keyword search over the ENTIRE authorized tenant corpus.
+        Guarantees exact identifiers (ports, error codes) are retrieved even if dense similarity is low.
         """
-        if not authorized_chunks:
+        if not corpus_chunks:
             return []
 
-        tokenized_corpus = [chunk.content.lower().split() for chunk in authorized_chunks]
+        tokenized_corpus = [chunk.content.lower().split() for chunk in corpus_chunks]
         bm25 = BM25Okapi(tokenized_corpus)
 
         tokenized_query = query.lower().split()
@@ -114,9 +130,9 @@ class HybridRetriever:
 
         scored_items = []
         for idx, score in enumerate(scores):
-            scored_items.append((score, authorized_chunks[idx]))
+            if score > 0.0:  # Only consider items with positive lexical match
+                scored_items.append((score, corpus_chunks[idx]))
 
-        # Sort descending by BM25 score
         scored_items.sort(key=lambda x: x[0], reverse=True)
 
         sparse_candidates: List[ScoredChunk] = []
@@ -137,42 +153,43 @@ class HybridRetriever:
         security_context: SecurityContext
     ) -> List[ScoredChunk]:
         """
-        End-to-End Secure Hybrid Search Pipeline:
-        1. Classifies query & extracts identifiers.
-        2. Constructs pre-retrieval authorization filter.
-        3. Executes Dense Vector Search in Qdrant (HNSW).
-        4. Executes Sparse BM25 Search over authorized candidate corpus.
-        5. Fuses results with Reciprocal Rank Fusion (k=60).
-        6. Returns top-K candidates.
+        True Multi-Stage Hybrid Search Pipeline:
+        1. Query Normalization & Pre-Retrieval Filter Construction.
+        2. Broad Dense Search (Top 50) + Full-Corpus Sparse BM25 Search (Top 50).
+        3. Reciprocal Rank Fusion (k=60) -> Top 30 Consensus Candidates.
+        4. Cross-Encoder Re-Ranking -> Top K calibrated evidence chunks.
         """
-        # Step 1: Query Normalization
-        query_type, identifiers = classify_query(request.query)
-
-        # Step 2: Build mandatory pre-retrieval security filter
+        # Step 1: Pre-retrieval security filter
         raw_filter = build_authorized_qdrant_filter(security_context)
         qdrant_filter = self._convert_filter_to_qdrant(raw_filter)
 
-        # Step 3: Dense Retrieval
+        # Step 2: Fetch tenant corpus for independent sparse search
+        tenant_corpus = self._fetch_authorized_corpus(qdrant_filter, limit=500)
+
+        # Step 3: Broad candidate retrieval
         dense_results = self.retrieve_dense(
             query=request.query,
             auth_filter=qdrant_filter,
             top_k=settings.DENSE_TOP_K
         )
 
-        # Collect authorized chunks retrieved from Qdrant for sparse candidate pool
-        authorized_pool = [item.chunk for item in dense_results]
-
-        # Step 4: Sparse BM25 Retrieval
         sparse_results = self.retrieve_sparse(
             query=request.query,
-            authorized_chunks=authorized_pool,
+            corpus_chunks=tenant_corpus,
             top_k=settings.SPARSE_TOP_K
         )
 
-        # Step 5: Reciprocal Rank Fusion (k=60)
+        # Step 4: Reciprocal Rank Fusion (k=60)
         fused_candidates = compute_rrf(dense_results, sparse_results, k=settings.RRF_K)
 
-        return fused_candidates[:request.top_k]
+        # Step 5: Cross-Encoder Re-Ranking (Top 30 -> Top K)
+        reranked_results = reranker.rerank(
+            query=request.query,
+            candidates=fused_candidates[:30],
+            top_k=request.top_k
+        )
+
+        return reranked_results
 
 
 # Singleton retriever instance

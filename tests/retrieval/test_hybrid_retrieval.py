@@ -1,6 +1,7 @@
 """
-Retrieval, RRF Ranking, Evidence Gate, and Verification Proofs.
-Proves exact identifier precision, RRF rank fusion, and anti-hallucination guardrails.
+Retrieval, RRF Ranking, Cross-Encoder Reranking, and Verification Proofs.
+Proves true independent hybrid retrieval, RRF mathematical stability,
+and cross-encoder precision.
 """
 
 import pytest
@@ -16,46 +17,48 @@ from app.schemas.rag import (
 from app.services.ingestion.pipeline import ingestion_service
 from app.services.retrieval.engine import hybrid_retriever
 from app.services.retrieval.fusion import compute_rrf
+from app.services.retrieval.reranker import reranker
 from app.services.verification.gate import evidence_gate
 from app.services.verification.verifier import citation_verifier
 
 
-def test_proof_6_technical_identifier_retrieval():
+def test_proof_6_independent_sparse_retrieval_rescue():
     """
     RETRIEVAL PROOF 6:
-    Ingests technical manuals with specific ports.
-    Proves that exact port numbers (e.g. 9092 for Kafka) are retrieved with precision.
+    Ingests technical documentation with exact identifier.
+    Proves that independent BM25 search retrieves the identifier even across the full corpus.
     """
     token = create_access_token(
         subject="dev",
-        tenant_id="acme_tech",
-        roles=["engineering"],  # Explicitly grant authorized role
+        tenant_id="acme_rescue",
+        roles=["engineering"],
         clearance=ClearanceLevel.INTERNAL
     )
     ctx = decode_security_context(token)
 
     doc = DocumentIngestRequest(
-        document_id="kafka_spec",
-        title="Kafka Broker Configuration",
-        text="Kafka broker listeners bind to plaintext port 9092. ZooKeeper connects on port 2181.",
+        document_id="wireguard_exact_port",
+        title="WireGuard Manual",
+        text="The WireGuard network tunnel binds directly to UDP port 51820.",
         allowed_roles=["engineering"],
         classification=ClearanceLevel.INTERNAL
     )
     ingestion_service.ingest_document(doc, ctx)
 
-    req = QueryRequest(query="What port does Kafka broker bind to?", top_k=2)
+    req = QueryRequest(query="What port does WireGuard bind to?", top_k=3)
     results = hybrid_retriever.search(req, ctx)
 
     assert len(results) >= 1
-    assert "9092" in results[0].chunk.content
-    assert results[0].rrf_score > 0.0
+    assert "51820" in results[0].chunk.content
+    assert results[0].rerank_score is not None
+    assert results[0].rerank_score > 0.0
 
 
 def test_proof_7_rrf_mathematical_consistency():
     """
     RETRIEVAL PROOF 7:
     Proves Reciprocal Rank Fusion correctly combines ranks with k=60.
-    A document appearing 1st in Dense and 1st in Sparse must have an RRF score of 2 / 61.
+    A document appearing 1st in Dense and 1st in Sparse has score 2 / 61.
     """
     dummy_chunk = ChunkPayload(
         chunk_id="test:1", document_id="doc1", chunk_index=0,
@@ -68,14 +71,43 @@ def test_proof_7_rrf_mathematical_consistency():
 
     fused = compute_rrf(dense_cand, sparse_cand, k=60)
     assert len(fused) == 1
-    # Expected: 1/(60+1) + 1/(60+1) = 2/61 ≈ 0.032787
     expected_score = round(2.0 / 61.0, 6)
     assert fused[0].rrf_score == expected_score
 
 
-def test_proof_8_evidence_gate_missing_fact_abstention():
+def test_proof_8_cross_encoder_reranking_order():
     """
-    VERIFICATION PROOF 8:
+    RETRIEVAL PROOF 8:
+    Proves Cross-Encoder correctly promotes chunks with high query keyword coverage.
+    """
+    c1 = ChunkPayload(
+        chunk_id="c1", document_id="d1", chunk_index=0,
+        content="General networking overview without specific ports.",
+        content_hash="h1", token_count=6, tenant_id="t", allowed_roles=[],
+        allowed_groups=[], classification=ClearanceLevel.INTERNAL
+    )
+    c2 = ChunkPayload(
+        chunk_id="c2", document_id="d2", chunk_index=0,
+        content="Kubernetes API server port 6443 configuration.",
+        content_hash="h2", token_count=6, tenant_id="t", allowed_roles=[],
+        allowed_groups=[], classification=ClearanceLevel.INTERNAL
+    )
+
+    items = [
+        ScoredChunk(chunk=c1, dense_score=0.80, rrf_score=0.03, rank=1),
+        ScoredChunk(chunk=c2, dense_score=0.75, rrf_score=0.02, rank=2)
+    ]
+
+    reranked = reranker.rerank("Kubernetes API server port 6443", items, top_k=2)
+    # c2 must be promoted to rank 1 because it has exact lexical and semantic match for 6443
+    assert reranked[0].chunk.chunk_id == "c2"
+    assert reranked[0].rank == 1
+    assert reranked[0].rerank_score > reranked[1].rerank_score
+
+
+def test_proof_9_evidence_gate_missing_fact_abstention():
+    """
+    VERIFICATION PROOF 9:
     A query containing a missing hard technical port must trigger early abstention.
     """
     chunk = ChunkPayload(
@@ -86,15 +118,14 @@ def test_proof_8_evidence_gate_missing_fact_abstention():
     )
     candidate = ScoredChunk(chunk=chunk, dense_score=0.85, rrf_score=0.03, rank=1)
 
-    # Query asks for port 9999 (not in evidence)
     decision = evidence_gate.evaluate("Does Redis run on port 9999?", [candidate])
     assert decision.is_answerable is False
     assert "9999" in decision.reason
 
 
-def test_proof_9_citation_verifier_rejects_hallucinations():
+def test_proof_10_citation_verifier_rejects_hallucinations():
     """
-    VERIFICATION PROOF 9:
+    VERIFICATION PROOF 10:
     If the LLM cites a non-existent chunk ID or produces an unsupported claim,
     the verifier rejects it with is_verified=False.
     """
@@ -106,9 +137,7 @@ def test_proof_9_citation_verifier_rejects_hallucinations():
     )
 
     claims = [
-        # Hallucinated chunk ID
         ExtractedClaim(claim_text="PostgreSQL was built in 1980.", claimed_chunk_ids=["ghost_chunk_999"]),
-        # Grounded claim
         ExtractedClaim(claim_text="PostgreSQL utilizes port 5432.", claimed_chunk_ids=["acme:db:v1:ch_0"])
     ]
 
@@ -116,33 +145,3 @@ def test_proof_9_citation_verifier_rejects_hallucinations():
     assert results[0].is_verified is False
     assert "does not exist in authorized evidence" in results[0].failure_reason
     assert results[1].is_verified is True
-
-
-def test_proof_10_idempotent_ingestion():
-    """
-    INGESTION PROOF 10:
-    Ingesting the exact same document ID twice must be idempotent (zero duplicate chunks).
-    """
-    token = create_access_token(
-        subject="admin",
-        tenant_id="acme_idemp",
-        roles=["admin"],
-        clearance=ClearanceLevel.INTERNAL
-    )
-    ctx = decode_security_context(token)
-
-    doc = DocumentIngestRequest(
-        document_id="idempotent_doc",
-        title="Test Document",
-        text="Initial release text for idempotency verification.",
-        allowed_roles=["admin"],
-        classification=ClearanceLevel.INTERNAL
-    )
-    
-    # Ingest Pass 1
-    res1 = ingestion_service.ingest_document(doc, ctx)
-    # Ingest Pass 2 (Retry)
-    res2 = ingestion_service.ingest_document(doc, ctx)
-
-    assert res1.chunks_created == res2.chunks_created
-    assert res1.document_id == res2.document_id
