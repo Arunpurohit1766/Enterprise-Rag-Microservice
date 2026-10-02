@@ -1,7 +1,7 @@
 """
 Enterprise Knowledge & Retrieval Microservice Entrypoint.
-Configures FastAPI app, CORS middleware, API v1 router, health probes,
-and seamless root redirection to Swagger documentation.
+Configures FastAPI app, strict CORS policies, route boundaries,
+and production documentation toggles.
 """
 
 from fastapi import FastAPI
@@ -12,28 +12,36 @@ from app.api.v1.endpoints.rag import router as rag_router
 from app.core.config import settings
 
 
+docs_url = "/docs" if (settings.ENVIRONMENT != "production" or settings.ENABLE_DOCS_IN_PRODUCTION) else None
+redoc_url = "/redoc" if (settings.ENVIRONMENT != "production" or settings.ENABLE_DOCS_IN_PRODUCTION) else None
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     description="Enterprise Multi-Tenant Knowledge & Retrieval Microservice with Hybrid RRF and Citation Verification.",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=docs_url,
+    redoc_url=redoc_url,
 )
 
-# CORS Middleware (Enterprise standard: configure allowed origins)
+# Strict CORS: Reject wildcard origins in enterprise deployments
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
-# Root endpoint: Seamlessly redirects reviewers directly to Swagger UI
+# Root endpoint
 @app.get("/", include_in_schema=False)
-async def root_redirect():
-    """Redirect root traffic directly to interactive Swagger documentation."""
-    return RedirectResponse(url="/docs")
+async def root():
+    if docs_url:
+        return RedirectResponse(url=docs_url)
+    return {
+        "service": settings.PROJECT_NAME,
+        "status": "OPERATIONAL",
+        "version": settings.VERSION
+    }
 
 
 # Mount API v1 Routes
