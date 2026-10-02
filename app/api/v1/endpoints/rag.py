@@ -1,16 +1,19 @@
 """
-FastAPI REST Endpoints for Knowledge Ingestion, Querying, and Auth Simulation.
-Enforces the Ingress Security Boundary:
-Caller identity is strictly extracted from Bearer tokens via Dependency Injection.
+FastAPI REST Endpoints for Knowledge Ingestion and Querying.
+Enforces Ingress Security Perimeter:
+- Scope checks ('knowledge:read', 'knowledge:write')
+- Write authorization policies (clearance bounds, wildcard protection)
+- Zero public token minting endpoints in production.
 """
 
-from typing import List, Optional
 from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel, Field
 
-from app.core.security import create_access_token, get_current_security_context
+from app.core.security import (
+    get_current_security_context,
+    require_scope,
+    validate_write_authorization,
+)
 from app.schemas.rag import (
-    ClearanceLevel,
     DocumentIngestRequest,
     DocumentIngestResponse,
     QueryRequest,
@@ -24,46 +27,6 @@ from app.services.rag_service import rag_service
 router = APIRouter()
 
 
-class TokenMintRequest(BaseModel):
-    """Payload for minting test JWTs with custom tenant contexts."""
-    subject: str = Field(default="user_test_1")
-    tenant_id: str = Field(default="acme_corp")
-    roles: List[str] = Field(default_factory=lambda: ["engineering"])
-    groups: List[str] = Field(default_factory=lambda: ["core-team"])
-    clearance: ClearanceLevel = Field(default=ClearanceLevel.INTERNAL)
-
-
-class TokenMintResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    tenant_id: str
-    clearance: str
-
-
-@router.post(
-    "/auth/token",
-    response_model=TokenMintResponse,
-    summary="Mint test JWT with specific tenant and ABAC context"
-)
-async def mint_test_token(req: TokenMintRequest) -> TokenMintResponse:
-    """
-    Utility endpoint to issue cryptographically signed JWTs
-    for integration testing and API consumer onboarding.
-    """
-    token = create_access_token(
-        subject=req.subject,
-        tenant_id=req.tenant_id,
-        roles=req.roles,
-        groups=req.groups,
-        clearance=req.clearance
-    )
-    return TokenMintResponse(
-        access_token=token,
-        tenant_id=req.tenant_id,
-        clearance=req.clearance.value
-    )
-
-
 @router.post(
     "/ingest",
     response_model=DocumentIngestResponse,
@@ -72,12 +35,17 @@ async def mint_test_token(req: TokenMintRequest) -> TokenMintResponse:
 )
 async def ingest_document(
     request: DocumentIngestRequest,
-    ctx: SecurityContext = Depends(get_current_security_context)
+    ctx: SecurityContext = Depends(require_scope("knowledge:write"))
 ) -> DocumentIngestResponse:
     """
     Ingests, chunks, embeds, and indexes a document.
-    Security Invariant: Tenant identity is stamped directly from the authenticated JWT.
+    Security Invariants:
+    1. Caller must have 'knowledge:write' scope.
+    2. Caller cannot ingest documents with classifications higher than their clearance.
+    3. Caller cannot set wildcard '*' access without 'admin' role.
+    4. Tenant identity is strictly derived from the authenticated JWT.
     """
+    validate_write_authorization(request, ctx)
     return ingestion_service.ingest_document(request, ctx)
 
 
@@ -88,14 +56,15 @@ async def ingest_document(
 )
 async def query_knowledge_base(
     request: QueryRequest,
-    ctx: SecurityContext = Depends(get_current_security_context)
+    ctx: SecurityContext = Depends(require_scope("knowledge:read"))
 ) -> RAGResponse:
     """
     Executes the full enterprise RAG pipeline:
-    1. Pre-retrieval authorization filter.
-    2. Hybrid Search (Dense HNSW + Sparse BM25 + RRF).
-    3. Evidence Gate (Answerability check).
-    4. Structured Groq Generation.
-    5. Post-generation citation verification.
+    1. Enforces 'knowledge:read' scope.
+    2. Pre-retrieval authorization filter.
+    3. Hybrid Search (Dense HNSW + Sparse BM25 + RRF).
+    4. Evidence Gate (Answerability check).
+    5. Structured Groq Generation.
+    6. Post-generation citation verification.
     """
     return rag_service.execute_query(request, ctx)

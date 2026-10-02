@@ -1,23 +1,20 @@
 """
-Cryptographic Security, JWT Token Processing, and ABAC/RBAC Policy Engine.
-Implements the core invariant: Authorization happens BEFORE retrieval.
+Cryptographic Security, OIDC Claims Validation, and ABAC/RBAC Policy Engine.
+Enforces that authorization, scope verification, and write policies happen BEFORE execution.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.config import settings
-from app.schemas.rag import ClearanceLevel, SecurityContext
+from app.schemas.rag import ClearanceLevel, DocumentIngestRequest, SecurityContext
 
 
-# HTTP Bearer scheme for Authorization: Bearer <token>
 security_scheme = HTTPBearer(auto_error=True)
 
-
-# Clearance hierarchy definition: lower index has fewer privileges
 CLEARANCE_HIERARCHY = {
     ClearanceLevel.PUBLIC: 0,
     ClearanceLevel.INTERNAL: 1,
@@ -37,22 +34,21 @@ def create_access_token(
     expires_delta: Optional[timedelta] = None,
 ) -> str:
     """
-    Creates a cryptographically signed HMAC-SHA256 JWT carrying the full SecurityContext.
-    Used by test suites and auth gateways to issue enterprise identity tokens.
+    Creates a cryptographically signed HMAC-SHA256 JWT carrying full claims,
+    strictly validated with issuer and audience metadata.
     """
     now = datetime.now(timezone.utc)
-    if expires_delta:
-        expire = now + expires_delta
-    else:
-        expire = now + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = now + (expires_delta or timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES))
 
     to_encode: Dict[str, Any] = {
         "sub": subject,
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
         "tenant_id": tenant_id,
         "roles": roles or [],
         "groups": groups or [],
         "clearance": clearance.value if isinstance(clearance, ClearanceLevel) else clearance,
-        "scopes": scopes or [],
+        "scopes": scopes or ["knowledge:read", "knowledge:write"],
         "policy_version": policy_version,
         "iat": now,
         "exp": expire,
@@ -63,28 +59,30 @@ def create_access_token(
 def decode_security_context(token: str) -> SecurityContext:
     """
     Decodes and cryptographically validates a JWT token.
-    Derives the immutable SecurityContext.
-    Fails closed if the token is tampered, expired, or missing mandatory claims.
+    Enforces signature, expiration, issuer (iss), and audience (aud).
+    Fails closed if any claim is invalid or tampered.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials or token expired",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    
+
     try:
         payload = jwt.decode(
             token,
             settings.JWT_SECRET_KEY,
-            algorithms=[settings.JWT_ALGORITHM]
+            algorithms=[settings.JWT_ALGORITHM],
+            issuer=settings.JWT_ISSUER,
+            audience=settings.JWT_AUDIENCE,
         )
-        
+
         subject: Optional[str] = payload.get("sub")
         tenant_id: Optional[str] = payload.get("tenant_id")
-        
+
         if not subject or not tenant_id:
             raise credentials_exception
-            
+
         raw_clearance = payload.get("clearance", ClearanceLevel.INTERNAL.value)
         try:
             clearance = ClearanceLevel(raw_clearance)
@@ -100,7 +98,7 @@ def decode_security_context(token: str) -> SecurityContext:
             scopes=payload.get("scopes", []),
             policy_version=payload.get("policy_version", "1.0.0")
         )
-        
+
     except JWTError:
         raise credentials_exception
 
@@ -108,29 +106,59 @@ def decode_security_context(token: str) -> SecurityContext:
 async def get_current_security_context(
     auth_header: HTTPAuthorizationCredentials = Depends(security_scheme)
 ) -> SecurityContext:
-    """
-    FastAPI dependency that extracts the Bearer token, validates it,
-    and injects the immutable SecurityContext into request routes.
-    """
+    """FastAPI dependency: extracts and cryptographically validates caller context."""
     return decode_security_context(auth_header.credentials)
 
 
-def is_clearance_sufficient(user_clearance: ClearanceLevel, required_clearance: ClearanceLevel) -> bool:
+def require_scope(required_scope: str) -> Callable:
     """
-    Evaluates whether a user's clearance level satisfies the document's classification.
-    E.g., CONFIDENTIAL (2) can access INTERNAL (1) and PUBLIC (0), but not RESTRICTED (3).
+    Dependency factory: Enforces OAuth2 scope compliance.
+    E.g. require_scope('knowledge:read') or require_scope('knowledge:write')
     """
-    return CLEARANCE_HIERARCHY.get(user_clearance, 0) >= CLEARANCE_HIERARCHY.get(required_clearance, 0)
+    async def scope_dependency(
+        ctx: SecurityContext = Depends(get_current_security_context)
+    ) -> SecurityContext:
+        if required_scope not in ctx.scopes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Forbidden: Principal lacks required scope '{required_scope}'"
+            )
+        return ctx
+    return scope_dependency
+
+
+def validate_write_authorization(
+    request: DocumentIngestRequest,
+    ctx: SecurityContext
+) -> None:
+    """
+    Evaluates Ingestion Write Authorization Policy:
+    1. Principal cannot classify a document higher than their own clearance.
+    2. Principal cannot set wildcard allowed_roles (['*']) unless they possess the 'admin' role.
+    """
+    user_weight = CLEARANCE_HIERARCHY.get(ctx.clearance, 0)
+    doc_weight = CLEARANCE_HIERARCHY.get(request.classification, 0)
+
+    if doc_weight > user_weight:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Write policy violation: Cannot ingest document with classification '{request.classification.value}' "
+                f"exceeding principal clearance '{ctx.clearance.value}'."
+            )
+        )
+
+    if "*" in request.allowed_roles and "admin" not in ctx.roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Write policy violation: Only principals with 'admin' role can assign wildcard '*' access."
+        )
 
 
 def build_authorized_qdrant_filter(security_context: SecurityContext) -> Dict[str, Any]:
     """
     Constructs the pre-retrieval Qdrant filter condition based on RBAC + ABAC.
-    Enforces the core architectural invariant:
-        RetrievedChunks ⊆ AuthorizedCorpus(tenant, roles, groups, clearance)
-    
-    This filter is compiled by the application and handed to Qdrant BEFORE retrieval.
-    The LLM never touches this filter.
+    Enforces: RetrievedChunks ⊆ AuthorizedCorpus(tenant, roles, groups, clearance)
     """
     allowed_clearances = [
         level.value
@@ -138,10 +166,6 @@ def build_authorized_qdrant_filter(security_context: SecurityContext) -> Dict[st
         if weight <= CLEARANCE_HIERARCHY.get(security_context.clearance, 0)
     ]
 
-    # Qdrant boolean filter dictionary structure:
-    # 1. Must match tenant_id (HARD MULTI-TENANT ISOLATION)
-    # 2. Must match allowed classification levels (ABAC)
-    # 3. Must match user's roles OR user's groups OR public document (RBAC)
     return {
         "must": [
             {"key": "tenant_id", "match": {"value": security_context.tenant_id}},
@@ -150,6 +174,6 @@ def build_authorized_qdrant_filter(security_context: SecurityContext) -> Dict[st
         "should": [
             {"key": "allowed_roles", "match": {"any": security_context.roles}},
             {"key": "allowed_groups", "match": {"any": security_context.groups}},
-            {"key": "allowed_roles", "match": {"value": "*"}},  # Wildcard for globally accessible chunks
+            {"key": "allowed_roles", "match": {"value": "*"}},
         ]
     }
