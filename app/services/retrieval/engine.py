@@ -166,28 +166,43 @@ class HybridRetriever:
         # Step 2: Fetch tenant corpus for independent sparse search
         tenant_corpus = self._fetch_authorized_corpus(qdrant_filter, limit=500)
 
-        # Step 3: Broad candidate retrieval
+                # Step 3: Broad candidate retrieval with high-resolution telemetry
+        t_dense = time.perf_counter()
         dense_results = self.retrieve_dense(
             query=request.query,
             auth_filter=qdrant_filter,
             top_k=settings.DENSE_TOP_K
         )
+        dense_ms = (time.perf_counter() - t_dense) * 1000.0
 
+        t_sparse = time.perf_counter()
         sparse_results = self.retrieve_sparse(
             query=request.query,
             corpus_chunks=tenant_corpus,
             top_k=settings.SPARSE_TOP_K
         )
+        sparse_ms = (time.perf_counter() - t_sparse) * 1000.0
 
         # Step 4: Reciprocal Rank Fusion (k=60)
+        t_rrf = time.perf_counter()
         fused_candidates = compute_rrf(dense_results, sparse_results, k=settings.RRF_K)
+        rrf_ms = (time.perf_counter() - t_rrf) * 1000.0
 
         # Step 5: Cross-Encoder Re-Ranking (Top 30 -> Top K)
+        t_rerank = time.perf_counter()
         reranked_results = reranker.rerank(
             query=request.query,
-            candidates=fused_candidates[:30],
+            candidates=fused_candidates[:getattr(settings, "RRF_TOP_K", 30)],
             top_k=request.top_k
         )
+        rerank_ms = (time.perf_counter() - t_rerank) * 1000.0
+
+        self.last_search_timings = {
+            "dense_retrieval_ms": round(dense_ms, 2),
+            "sparse_retrieval_ms": round(sparse_ms, 2),
+            "rrf_fusion_ms": round(rrf_ms, 2),
+            "rerank_ms": round(rerank_ms, 2)
+        }
 
         return reranked_results
 

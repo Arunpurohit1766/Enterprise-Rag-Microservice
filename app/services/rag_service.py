@@ -83,10 +83,11 @@ class EnterpriseRAGService:
 
         if not gating_decision.is_answerable:
             total_time_ms = (time.perf_counter() - start_time) * 1000
+            engine_timings = getattr(self.retrieval_engine, "last_search_timings", {})
             timing_receipt = TimingReceipt(
-                dense_retrieval_ms=round(retrieval_time_ms / 2, 2),
-                sparse_retrieval_ms=round(retrieval_time_ms / 2, 2),
-                rrf_fusion_ms=1.0,
+                dense_retrieval_ms=engine_timings.get("dense_retrieval_ms", round(retrieval_time_ms / 2, 2)),
+                sparse_retrieval_ms=engine_timings.get("sparse_retrieval_ms", round(retrieval_time_ms / 2, 2)),
+                rrf_fusion_ms=engine_timings.get("rrf_fusion_ms", 0.5),
                 evidence_gate_ms=round(gate_time_ms, 2),
                 total_ms=round(total_time_ms, 2)
             )
@@ -148,10 +149,11 @@ class EnterpriseRAGService:
 
         citations_list = [c.model_dump() if hasattr(c, "model_dump") else c for c in ranked_chunks]
 
+        engine_timings = getattr(self.retrieval_engine, "last_search_timings", {})
         timing_receipt = TimingReceipt(
-            dense_retrieval_ms=round(retrieval_time_ms / 2, 2),
-            sparse_retrieval_ms=round(retrieval_time_ms / 2, 2),
-            rrf_fusion_ms=1.0,
+            dense_retrieval_ms=engine_timings.get("dense_retrieval_ms", round(retrieval_time_ms / 2, 2)),
+            sparse_retrieval_ms=engine_timings.get("sparse_retrieval_ms", round(retrieval_time_ms / 2, 2)),
+            rrf_fusion_ms=engine_timings.get("rrf_fusion_ms", 0.5),
             evidence_gate_ms=round(gate_time_ms, 2),
             llm_generation_ms=round(generation_time_ms, 2),
             citation_verification_ms=round(verify_time_ms, 2),
