@@ -7,13 +7,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer
 
 from app.core.config import settings
 from app.schemas.rag import ClearanceLevel, DocumentIngestRequest, SecurityContext
 
 
-security_scheme = HTTPBearer(auto_error=True)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
+http_bearer_scheme = HTTPBearer(auto_error=False)
 
 CLEARANCE_HIERARCHY = {
     ClearanceLevel.PUBLIC: 0,
@@ -104,10 +105,18 @@ def decode_security_context(token: str) -> SecurityContext:
 
 
 async def get_current_security_context(
-    auth_header: HTTPAuthorizationCredentials = Depends(security_scheme)
+    oauth2_token: Optional[str] = Depends(oauth2_scheme),
+    bearer_creds: Optional[HTTPAuthorizationCredentials] = Depends(http_bearer_scheme),
 ) -> SecurityContext:
-    """FastAPI dependency: extracts and cryptographically validates caller context."""
-    return decode_security_context(auth_header.credentials)
+    """FastAPI dependency: extracts and cryptographically validates caller context from OAuth2 or Bearer header."""
+    token = oauth2_token or (bearer_creds.credentials if bearer_creds else None)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token required. Use OAuth2 login or Bearer authorization header.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return decode_security_context(token)
 
 
 def require_scope(required_scope: str) -> Callable:
