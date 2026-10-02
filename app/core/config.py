@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     VERSION: str = "1.0.0"
     API_V1_STR: str = "/api/v1"
     ENVIRONMENT: str = Field(default="development", description="development | staging | production")
-    ENABLE_DOCS_IN_PRODUCTION: bool = False
+    ENABLE_DOCS_IN_PRODUCTION: bool = True
 
     # Ingress Security & CORS
     ALLOWED_CORS_ORIGINS: List[str] = Field(

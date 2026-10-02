@@ -226,9 +226,34 @@ Authentication utilizes RFC 7519 HMAC-SHA256 JWT tokens:
 
 ---
 
-## 6. API Reference
+## 6. API Reference & Swagger Authentication
 
-### 6.1 Ingest Document
+### 6.1 OAuth2 Password Flow Login
+Authenticates principal and issues a signed JWT token containing tenant isolation claims. Used natively by Swagger UI (**Authorize** button) and REST API consumers.
+
+**Endpoint:** `POST /api/v1/auth/token`  
+**Content-Type:** `application/x-www-form-urlencoded`
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/auth/token" \
+     -H "Content-Type: application/x-www-form-urlencoded" \
+     -d "username=admin&password=password"
+```
+
+**Response (`200 OK`):**
+```json
+{
+  "access_token": "eyJhbGciOi...",
+  "token_type": "bearer",
+  "tenant_id": "tenant_corp_alpha",
+  "roles": ["admin", "user", "engineering"],
+  "scopes": ["knowledge:read", "knowledge:write"]
+}
+```
+
+---
+
+### 6.2 Ingest Document
 
 Registers, chunks, hashes, and indexes a raw document under the caller's authenticated tenant partition.
 
@@ -262,7 +287,7 @@ curl -X POST "http://localhost:8000/api/v1/rag/ingest" \
 
 ---
 
-### 6.2 Grounded Query with Citation Verification
+### 6.3 Grounded Query with Citation Verification
 
 Executes hybrid retrieval, checks evidence sufficiency, generates structured claims, and validates citations.
 

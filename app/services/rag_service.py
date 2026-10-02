@@ -142,6 +142,7 @@ class EnterpriseRAGService:
                     c_text = first_c.get("chunk", {}).get("content", "") or first_c.get("content", "")
                 else:
                     c_text = getattr(getattr(first_c, "chunk", None), "content", "") or getattr(first_c, "content", "")
+            c_text = " ".join(c_text.split())
             raw_answer = c_text if c_text else "The production cluster primary gateway operates on port 8443 with TLS 1.3 termination [1]. The Prometheus monitoring instance is exposed on port 9090 [1]."
 
         generation_time_ms = (time.perf_counter() - generation_start) * 1000
@@ -150,7 +151,10 @@ class EnterpriseRAGService:
         verify_start = time.perf_counter()
         verification_result = self.citation_verifier.verify(
             answer=raw_answer,
-            retrieved_chunks=usable_chunks,
+            retrieved_chunks=[
+            (c.get("chunk", c) if isinstance(c, dict) else getattr(c, "chunk", c))
+            for c in usable_chunks
+        ],
         )
         verify_time_ms = (time.perf_counter() - verify_start) * 1000
         total_time_ms = (time.perf_counter() - start_time) * 1000
@@ -182,7 +186,7 @@ class EnterpriseRAGService:
         return RAGResponse(
             status="ANSWERED" if verification_result.verification_status == "PASSED" else "PARTIALLY_ANSWERED",
             query=query_request.query,
-            answer=verification_result.verified_answer,
+            answer=" ".join(verification_result.verified_answer.split()),
             citations=citations_list,
             reason_code="VERIFICATION_SUCCESS" if verification_result.verification_status == "PASSED" else "VERIFICATION_PARTIAL",
             timings=timing_receipt,
